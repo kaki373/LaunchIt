@@ -1,5 +1,7 @@
 # machine-specific config and logs
 launchit.json
-launchit.log
+launchit*.json
+*.log
+*.bak
 __pycache__/
 *.pyc

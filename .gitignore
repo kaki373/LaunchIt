@@ -1,0 +1,5 @@
+# machine-specific config and logs
+launchit.json
+launchit.log
+__pycache__/
+*.pyc

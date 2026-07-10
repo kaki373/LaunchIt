@@ -34,7 +34,7 @@ test_pin_logic.py 方式(CONFIG_PATH を差し替えてヘッドレス実体化)
 ### 実行中判定(3系統)
 
 1. ProcessManager 追跡(自分で起動した Popen / adopt した pid)
-2. adopt_running: 外部起動の取り込み。.bat=cmd.exe の CommandLine 照合、.exe=ExecutablePath 照合(CIM 1クエリ)。起動時+トレイ再スキャン+ポップアップ表示時(60秒スロットル)
+2. adopt_running: 外部起動の取り込み。.bat=cmd.exe の CommandLine 照合、.exe=ExecutablePath 照合(CIM 1クエリ)。多プロセス app(Electron等)は ParentProcessId でルートを選んで adopt(子レンダラを掴むと停止が部分的にしか効かない)。起動時+トレイ再スキャン+ポップアップ表示時(60秒スロットル)。**「startで実体を起動して即exitするラッパーbat」は3系統のどれからも見えない** → 項目の path を実体exeに変えて args/cwd で補う(Octopus の例)
 3. ポート稼働(上記ウォッチャー)。`_is_active` = 1 or 3
 
 ### wingroup(CLIセッション検出)
@@ -44,7 +44,14 @@ ConsoleWindowClass)を `_refresh_list` 内で毎回列挙して合成項目 `typ
 表示中は毎秒フル再生成(選択は名前で維持)。`_win_cache` により、一度検出した
 ウィンドウはタイトルが一時的に非一致になっても生存していれば120秒リストに残す
 (エージェント動作中のタイトル瞬断対策)。Claude Code のタイトルは
-「✳(待機)/ U+2800台スピナー(動作中)+ セッション名」。
+「✳(待機)/ U+2800台スピナー(動作中)+ セッション名」。スピナー先頭なら
+`busy` フラグが立ち、ポップアップ表示中は `_anim_tick`(300ms)が Clawd
+(公式ドット絵から抽出した 12x8 グリッド、`_CLAWD_BASE`)をホップさせる
+(非表示中はラベル更新なし=負荷ゼロ)。スプライトは純 Tk PhotoImage
+(透過=未描画ピクセル)で、参照を `self._mascot` に保持しないと消える。**昇格ターミナルは
+タイトルに「管理者: 」が付く**ので判定前に剥がす(英語 Administrator も)。
+注意: claude シムでタイトル上書きを無効化すると busy が取れなくなるので、
+シムは初期タイトル設定のみ(CLAUDE_CODE_DISABLE_TERMINAL_TITLE は使わない)。
 
 ## ハマりどころ(全部実際に踏んだ)
 
@@ -65,6 +72,13 @@ ConsoleWindowClass)を `_refresh_list` 内で毎回列挙して合成項目 `typ
 - **os.path.isdir は切断されたネットワークパスで数秒ブロックする** →
   Recent の解決(isdir 含む)は必ずワーカースレッドで。Tk スレッドでやると
   ポップアップが固まる
+- **「背景だけ透過・文字は不透明」は実装を断念した(2026-07-10、再挑戦非推奨)**。
+  Tk の -alpha は文字ごと薄くなるので不可。SetWindowCompositionAttribute の
+  ACCENT_ENABLE_ACRYLICBLURBEHIND は build 26200 では GradientColor の
+  暗色ティントが無視され「白っぽい磨りガラス」になるだけ(状態2/3/4とも)。
+  カラーキー(-transparentcolor)は透明部分のクリックが背面に抜けるので不採用。
+  ユーザー判断で機能ごと廃止済み。次に頼まれたら DirectComposition 等の
+  全面書き直しが必要になる旨を先に伝えること
 - **ホットキーが「効かない」デバッグ手順**: ①launchit.log の `hotkey fired (foreground=...)` を見る(届いているか)→ ②合成キー(keybd_event)で動くか → ③動くのに物理で動かないなら WH_KEYBOARD_LL の一時ロガーで LLKHF_INJECTED フラグ付きで記録 → **ユーザーが実際に押しているキーをまず疑う**(本件の実例: Shift+Space と言いながら Ctrl+Space を押していた)。UAC 無効環境(EnableLUA=0)では昇格説は成立しない
 
 ## 検証方法

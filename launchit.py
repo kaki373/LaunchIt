@@ -341,8 +341,8 @@ class ProcessManager:
             names.add("cmd.exe")
         flt = " OR ".join(f"Name='{n}'" for n in sorted(names))
         ps = (f"Get-CimInstance Win32_Process -Filter \"{flt}\" | "
-              "Select-Object ProcessId,Name,ExecutablePath,CommandLine | "
-              "ConvertTo-Json -Compress")
+              "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,"
+              "CommandLine | ConvertTo-Json -Compress")
         try:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps],
@@ -376,12 +376,19 @@ class ProcessManager:
             if self.is_running(item["name"]):
                 continue
             needle = os.path.normpath(item["path"]).lower()
-            for proc in data:
-                exe = os.path.normpath(proc.get("ExecutablePath") or "").lower()
-                if exe == needle:
-                    adopt(item, proc)
-                    adopted += 1
-                    break
+            cands = [p for p in data
+                     if os.path.normpath(p.get("ExecutablePath") or "").lower()
+                     == needle]
+            if not cands:
+                continue
+            # multi-process apps (Electron etc.): adopt the root process, not
+            # a child renderer, so stop kills the whole tree and the running
+            # state doesn't flip when a child exits
+            pids = {p["ProcessId"] for p in cands}
+            root = next((p for p in cands
+                         if p.get("ParentProcessId") not in pids), cands[0])
+            adopt(item, root)
+            adopted += 1
         return adopted
 
 
@@ -598,14 +605,19 @@ def _wingroup_items(group, wins):
         return []
     out = []
     for hwnd, _pid, title, _area in wins:
+        # elevated terminals prefix the title ("管理者: " / "Administrator: ")
+        # which would hide the leading status marker from the regex
+        title = re.sub(r"^(管理者|Administrator):\s*", "", title)
         if _win_class(hwnd) in TERMINAL_CLASSES and pat.search(title):
-            # drop Claude Code's leading status marker (✳ idle / ⠐ busy)
+            # Claude Code's leading status marker: braille spinner = busy,
+            # ✳ = waiting for input
+            busy = bool(title) and "⠀" <= title[0] <= "⣿"
             clean = re.sub(r"^[✳⠀-⣿]\s*", "", title)
             gname = group.get("name", "win")
             if clean.lower().startswith(gname.lower()):
                 clean = clean[len(gname):].lstrip(" -–:") or clean
             out.append({"type": "_win", "hwnd": hwnd, "group": gname,
-                        "color": group.get("color"),
+                        "color": group.get("color"), "busy": busy,
                         "name": f"{gname}: {clean[:38]}"})
     return out
 
@@ -792,6 +804,39 @@ HINT_MAIN = ("Enter:起動/開く   Space:最近のフォルダ   Ctrl+R:再起�
              "Ctrl+D:停止   右クリック:メニュー   Esc:閉じる")
 HINT_RECENT = ("最近使ったフォルダ   Enter:開く(開いていれば前面化)   "
                "右クリック:ロック/解除   ドラッグ:並び替え   Space/Esc:戻る")
+# Claude Code's mascot (Clawd), grid extracted from the official pixel art.
+# "#" = body, "." = transparent (the eyes are holes showing the background)
+_CLAWD_BASE = (
+    "..########..",
+    "..#.####.#..",
+    "############",
+    "############",
+    "..########..",
+    "..########..",
+    "..#.#..#.#..",
+    "..#.#..#.#..",
+)
+_CLAWD_FRAMES = (
+    ("............",) + _CLAWD_BASE,   # standing on the ground
+    _CLAWD_BASE + ("..#......#..",),   # hop: outer toes down
+    _CLAWD_BASE + ("....#..#....",),   # hop: inner toes down
+)
+_CLAWD_SEQ = (0, 1, 0, 2)  # bounce with alternating feet
+_CLAWD_COLOR = "#d27657"   # body color sampled from the official rendering
+
+
+def _clawd_photoimages(master, scale=2):
+    frames = []
+    for grid in _CLAWD_FRAMES:
+        ph = tk.PhotoImage(master=master, width=len(grid[0]) * scale,
+                           height=len(grid) * scale)
+        for y, row in enumerate(grid):
+            for x, c in enumerate(row):
+                if c == "#":
+                    ph.put(_CLAWD_COLOR, to=(x * scale, y * scale,
+                                             (x + 1) * scale, (y + 1) * scale))
+        frames.append(ph)
+    return frames
 
 
 class LaunchItApp:
@@ -816,10 +861,12 @@ class LaunchItApp:
         self._drag_src = None   # (index, x_root, y_root) of the pressed cell
         self._drag_on = False
         self._drag_tgt = None
+        self._anim = 0
         self._build_popup()
         threading.Thread(target=self._port_watcher, daemon=True).start()
         self.root.after(80, self._poll_queue)
         self.root.after(1000, self._tick)
+        self.root.after(300, self._anim_tick)
 
     # ---- window ----
 
@@ -834,20 +881,21 @@ class LaunchItApp:
         outer = tk.Frame(win, bg=COL_BG)
         outer.pack(fill="both", expand=True, padx=1, pady=1)
         self.outer = outer
+        self._mascot = _clawd_photoimages(win)  # keep refs or Tk drops them
 
         top = tk.Frame(outer, bg=COL_BG)
         top.pack(fill="x", padx=10, pady=(10, 6))
         self.query = tk.StringVar()
         self.query.trace_add("write", lambda *_: self._refresh_list())
         entry = tk.Entry(
-            top, textvariable=self.query, font=(FONT, 14),
-            bg="#282836", fg=COL_FG, insertbackground=COL_FG,
+            top, textvariable=self.query, font=(FONT, 12),
+            bg="#232330", fg=COL_FG, insertbackground=COL_FG,
             relief="flat", highlightthickness=0,
         )
-        entry.pack(side="left", fill="x", expand=True, ipady=6)
+        entry.pack(side="left", fill="x", expand=True, ipady=3)
         add_btn = tk.Button(
-            top, text="+", font=(FONT, 13, "bold"), width=3,
-            bg="#282836", fg=COL_FG, activebackground=COL_SEL,
+            top, text="+", font=(FONT, 12, "bold"), width=3,
+            bg="#232330", fg=COL_FG, activebackground=COL_SEL,
             activeforeground="#ffffff", relief="flat", takefocus=0,
             command=self._add_menu,
         )
@@ -1163,7 +1211,11 @@ class LaunchItApp:
             lbl.grid(row=row, column=col, sticky="ew")
             text, fg = self._item_label(item)
             selected = (i == self.sel)
-            lbl.config(text=text, font=fnt,
+            img = ""
+            if item.get("busy"):
+                img = self._mascot[_CLAWD_SEQ[self._anim % len(_CLAWD_SEQ)]]
+            lbl.config(text=text, font=fnt, image=img,
+                       compound="left" if img else "none",
                        fg="#ffffff" if selected else fg,
                        bg=COL_SEL if selected else COL_BG)
 
@@ -1171,6 +1223,9 @@ class LaunchItApp:
         typ = item.get("type", "app")
         custom = item.get("color")
         if typ == "_win":
+            if item.get("busy"):
+                # the dancing-mascot PhotoImage takes the icon's place
+                return f" {item['name']}", custom or COL_RUN
             return f"⌨ {item['name']}", custom or COL_RUN
         if typ == "folder":
             if item.get("_pinned"):
@@ -1221,6 +1276,16 @@ class LaunchItApp:
             # full refresh so running sessions appear/disappear live
             self._refresh_list(preserve_sel=True)
         self.root.after(1000, self._tick)
+
+    def _anim_tick(self):
+        """Advance the busy-session mascot dance. Only relabels while the
+        popup is visible and something is actually busy, so the hidden
+        popup costs nothing."""
+        if (self.visible and self.view == "main" and not self._drag_on
+                and any(it.get("busy") for it in self.filtered)):
+            self._anim += 1
+            self._refresh_list(rebuild_only=True)
+        self.root.after(300, self._anim_tick)
 
     def _is_active(self, item):
         """Running as a tracked process, or its WebUI port answers."""

@@ -454,10 +454,21 @@ def start_tray(cmd_queue):
     import pystray
     from PIL import Image, ImageDraw
 
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=(52, 78, 204, 255))
-    d.polygon([(24, 18), (24, 46), (48, 32)], fill=(255, 255, 255, 255))
+    img = None
+    ico = os.path.join(BASE_DIR, "launchit.ico")
+    if os.path.exists(ico):
+        try:
+            img = Image.open(ico)
+            img.size = (64, 64)  # pick the 64px frame
+            img = img.convert("RGBA")
+        except Exception:
+            log.exception("failed to load launchit.ico, using fallback icon")
+            img = None
+    if img is None:
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=(52, 78, 204, 255))
+        d.polygon([(24, 18), (24, 46), (48, 32)], fill=(255, 255, 255, 255))
 
     menu = pystray.Menu(
         pystray.MenuItem("表示", lambda: cmd_queue.put("show"), default=True),
@@ -605,6 +616,171 @@ def _focus_window(hwnd):
     user32.SetForegroundWindow(hwnd)
 
 
+# ------------------------------------------ recent folders (shell COM) ----
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort),
+                ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+
+    def __init__(self, s):
+        super().__init__()
+        ctypes.windll.ole32.CLSIDFromString(s, ctypes.byref(self))
+
+
+class _VARIANT(ctypes.Structure):
+    _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                ("val", ctypes.c_longlong), ("pad", ctypes.c_longlong)]
+
+
+_CLSID_ShellLink = _GUID("{00021401-0000-0000-C000-000000000046}")
+_IID_IShellLinkW = _GUID("{000214F9-0000-0000-C000-000000000046}")
+_IID_IPersistFile = _GUID("{0000010B-0000-0000-C000-000000000046}")
+_CLSID_ShellWindows = _GUID("{9BA05972-F6A8-11CF-A442-00A0C90A8F39}")
+_IID_IWebBrowser2 = _GUID("{D30C1661-CDAF-11D0-8A3E-00C04FC9E26E}")
+_IID_IShellWindows = _GUID("{85CB6900-4D95-11CF-960C-0080C7F4EE85}")
+
+
+def _com_method(ptr, index, *argtypes):
+    vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)
+    return proto(vtbl[index])
+
+
+def _com_release(ptr):
+    _com_method(ptr, 2)(ptr)
+
+
+def _recent_folders(limit=40):
+    """Folder targets of the shell Recent .lnk files, newest first.
+    Call off the Tk thread: os.path.isdir on a dead network share blocks."""
+    recent = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Recent")
+    entries = []
+    try:
+        for f in os.listdir(recent):
+            if f.lower().endswith(".lnk"):
+                p = os.path.join(recent, f)
+                try:
+                    entries.append((os.path.getmtime(p), p))
+                except OSError:
+                    pass
+    except OSError:
+        return []
+    entries.sort(reverse=True)
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitialize(None)
+    link = ctypes.c_void_p()
+    if ole32.CoCreateInstance(
+            ctypes.byref(_CLSID_ShellLink), None, 1,
+            ctypes.byref(_IID_IShellLinkW), ctypes.byref(link)) != 0:
+        return []
+    out, seen = [], set()
+    try:
+        pf = ctypes.c_void_p()
+        qi = _com_method(link, 0, ctypes.POINTER(_GUID),
+                         ctypes.POINTER(ctypes.c_void_p))
+        if qi(link, ctypes.byref(_IID_IPersistFile), ctypes.byref(pf)) != 0:
+            return []
+        try:
+            load = _com_method(pf, 5, ctypes.c_wchar_p, ctypes.c_ulong)
+            getpath = _com_method(link, 3, ctypes.c_wchar_p, ctypes.c_int,
+                                  ctypes.c_void_p, ctypes.c_ulong)
+            buf = ctypes.create_unicode_buffer(1024)
+            fd = ctypes.create_string_buffer(1024)  # WIN32_FIND_DATAW scratch
+            for _mt, lnk in entries:
+                if load(pf, lnk, 0) != 0:
+                    continue
+                if (getpath(link, buf, 1024,
+                            ctypes.cast(fd, ctypes.c_void_p), 0) != 0
+                        or not buf.value):
+                    continue  # S_FALSE: lnk without a file-system target
+                tgt = buf.value
+                key = tgt.lower().rstrip("\\")
+                if key in seen or not os.path.isdir(tgt):
+                    continue
+                seen.add(key)
+                out.append(tgt)
+                if len(out) >= limit:
+                    break
+        finally:
+            _com_release(pf)
+    finally:
+        _com_release(link)
+    return out
+
+
+def _url_to_path(url):
+    if not url.lower().startswith("file:"):
+        return None
+    u = urllib.parse.urlparse(url)
+    p = urllib.parse.unquote(u.path)
+    if u.netloc:  # UNC share
+        return "\\\\" + u.netloc + p.replace("/", "\\")
+    return os.path.normpath(p.lstrip("/"))
+
+
+def _explorer_windows():
+    """(hwnd, normalized folder path) for every open Explorer window.
+    Win11 tabs share one hwnd, so several paths may map to one window."""
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitialize(None)
+    sw = ctypes.c_void_p()
+    if ole32.CoCreateInstance(
+            ctypes.byref(_CLSID_ShellWindows), None, 0x15,
+            ctypes.byref(_IID_IShellWindows), ctypes.byref(sw)) != 0:
+        return []
+    out = []
+    try:
+        count = ctypes.c_long()
+        _com_method(sw, 7, ctypes.POINTER(ctypes.c_long))(
+            sw, ctypes.byref(count))                     # get_Count
+        item = _com_method(sw, 8, _VARIANT, ctypes.POINTER(ctypes.c_void_p))
+        for i in range(count.value):
+            disp = ctypes.c_void_p()
+            if (item(sw, _VARIANT(vt=3, val=i), ctypes.byref(disp)) != 0
+                    or not disp):
+                continue
+            try:
+                wb = ctypes.c_void_p()
+                qi = _com_method(disp, 0, ctypes.POINTER(_GUID),
+                                 ctypes.POINTER(ctypes.c_void_p))
+                if (qi(disp, ctypes.byref(_IID_IWebBrowser2),
+                       ctypes.byref(wb)) != 0 or not wb):
+                    continue
+                try:
+                    hwnd = ctypes.c_longlong()
+                    _com_method(wb, 37, ctypes.POINTER(ctypes.c_longlong))(
+                        wb, ctypes.byref(hwnd))          # get_HWND
+                    bstr = ctypes.c_void_p()
+                    _com_method(wb, 30, ctypes.POINTER(ctypes.c_void_p))(
+                        wb, ctypes.byref(bstr))          # get_LocationURL
+                    url = ctypes.wstring_at(bstr.value) if bstr.value else ""
+                    if bstr.value:
+                        ctypes.windll.oleaut32.SysFreeString(bstr)
+                    path = _url_to_path(url)
+                    if path and _win_class(hwnd.value) == "CabinetWClass":
+                        out.append((hwnd.value,
+                                    os.path.normpath(path).lower().rstrip("\\")))
+                finally:
+                    _com_release(wb)
+            finally:
+                _com_release(disp)
+    finally:
+        _com_release(sw)
+    return out
+
+
+def _short_path(path):
+    """Compact display form: drive + parent + folder ('D:\\…\\parent\\name')."""
+    drive, rest = os.path.splitdrive(os.path.normpath(path))
+    parts = [p for p in rest.split("\\") if p]
+    if not parts:
+        return drive + "\\"
+    if len(parts) <= 2:
+        return drive + "\\" + "\\".join(parts)
+    return drive + "\\…\\" + "\\".join(parts[-2:])
+
+
 COL_BG = "#1e1e28"
 COL_FG = "#e8e8f0"
 COL_DIM = "#8a8fa8"
@@ -612,6 +788,10 @@ COL_SEL = "#334ecc"
 COL_RUN = "#5ad46e"
 COL_BORDER = "#444a66"
 FONT = "Yu Gothic UI"
+HINT_MAIN = ("Enter:起動/開く   Space:最近のフォルダ   Ctrl+R:再起動   "
+             "Ctrl+D:停止   右クリック:メニュー   Esc:閉じる")
+HINT_RECENT = ("最近使ったフォルダ   Enter:開く(開いていれば前面化)   "
+               "右クリック:ロック/解除   ドラッグ:並び替え   Space/Esc:戻る")
 
 
 class LaunchItApp:
@@ -630,6 +810,12 @@ class LaunchItApp:
         self._port_kick = threading.Event()
         self._last_scan = 0.0
         self._win_cache = {}  # hwnd -> (item, last_matched_ts)
+        self.view = "main"    # "main" | "recent" (recent-folders page)
+        self._recent = []
+        self._recent_ts = 0.0
+        self._drag_src = None   # (index, x_root, y_root) of the pressed cell
+        self._drag_on = False
+        self._drag_tgt = None
         self._build_popup()
         threading.Thread(target=self._port_watcher, daemon=True).start()
         self.root.after(80, self._poll_queue)
@@ -678,9 +864,9 @@ class LaunchItApp:
             outer, textvariable=self.status, font=(FONT, 10),
             bg=COL_BG, fg=COL_RUN, anchor="w",
         ).pack(fill="x", padx=12)
+        self.hint = tk.StringVar(value=HINT_MAIN)
         tk.Label(
-            outer,
-            text="Enter:起動/開く   Ctrl+R:再起動   Ctrl+D:停止   右クリック:メニュー   Esc:閉じる",
+            outer, textvariable=self.hint,
             font=(FONT, 9), bg=COL_BG, fg=COL_DIM, anchor="w",
         ).pack(fill="x", padx=12, pady=(0, 8))
 
@@ -688,11 +874,12 @@ class LaunchItApp:
             # "break" stops class bindings (e.g. Entry's default Control-d)
             entry.bind(seq, lambda e, f=fn: f() or "break")
 
-        bindkey("<Escape>", self.hide)
+        bindkey("<Escape>", self._on_escape)
         bindkey("<Return>", self._activate)
         bindkey("<Control-Return>", self._open_dir)
         bindkey("<Control-r>", self._restart)
         bindkey("<Control-d>", self._stop)
+        entry.bind("<space>", self._on_space)
         entry.bind("<FocusOut>", self._on_focus_out)
         entry.bind("<Down>", lambda e: self._move_sel(1))
         entry.bind("<Up>", lambda e: self._move_sel(-1))
@@ -714,6 +901,9 @@ class LaunchItApp:
         if time.time() - self._last_scan > 60:  # pick up externally started apps
             self._last_scan = time.time()
             self.q.put("rescan")
+        self.view = "main"
+        self.hint.set(HINT_MAIN)
+        self._kick_recent()  # warm the cache for a Space press later
         self.query.set("")
         self._refresh_list()
         self._apply_geometry()
@@ -737,7 +927,7 @@ class LaunchItApp:
         wa = _cursor_work_area()  # monitor the cursor is on
         self.win.update_idletasks()  # settle the grid so reqheight is exact
         h = int(self.cfg.get("height", 0) or 0)
-        if h <= 0:  # auto: exactly fit the items
+        if h <= 0 or self.view == "recent":  # auto: exactly fit the items
             h = self.outer.winfo_reqheight() + 2
         h = min(h, wa.bottom - wa.top - 60)
         if self.cfg.get("position", "bottom-right") == "center":
@@ -760,7 +950,127 @@ class LaunchItApp:
         self.visible = False
 
     def toggle(self):
-        self.hide() if self.visible else self.show()
+        """Hotkey cycle: hidden -> main list -> recent folders -> hidden,
+        so holding the modifier and tapping Space twice lands on folders."""
+        if not self.visible:
+            self.show()
+        elif self.view == "main":
+            self._toggle_view()
+        else:
+            self.hide()
+
+    # ---- recent-folders view ----
+
+    def _kick_recent(self):
+        """Refresh the recent-folder cache in the background (throttled)."""
+        if time.time() - self._recent_ts < 10:
+            return
+        self._recent_ts = time.time()
+
+        def work():
+            try:
+                self._recent = _recent_folders()
+            except Exception:
+                log.exception("recent folder scan failed")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_space(self, _event):
+        if self.query.get().strip():
+            return None  # typing a query: let the space through
+        self._toggle_view()
+        return "break"
+
+    def _on_escape(self):
+        if self.view == "recent":
+            self._toggle_view()
+        else:
+            self.hide()
+
+    def _toggle_view(self):
+        self.view = "recent" if self.view == "main" else "main"
+        if self.view == "recent":
+            self._kick_recent()
+            log.info("recent view: %d folders cached", len(self._recent))
+        self.hint.set(HINT_RECENT if self.view == "recent" else HINT_MAIN)
+        self.query.set("")  # fires _refresh_list via the write trace
+        self._apply_geometry()
+
+    def _press(self, event, i):
+        self._select(i)
+        self._drag_src = (i, event.x_root, event.y_root)
+        self._drag_on = False
+
+    def _drag_motion(self, event):
+        if self.view != "recent" or self._drag_src is None:
+            return
+        si, px, py = self._drag_src
+        if not self._drag_on:
+            if abs(event.x_root - px) + abs(event.y_root - py) < 10:
+                return  # sloppy click, not a drag yet
+            self._drag_on = True
+            self.win.configure(cursor="hand2")
+        w = self.win.winfo_containing(event.x_root, event.y_root)
+        t = self.cells.index(w) if w in self.cells else None
+        if t is not None and (t >= len(self.filtered) or t == si):
+            t = None
+        if t == self._drag_tgt:
+            return
+        prev = self._drag_tgt
+        if prev is not None and prev < len(self.cells):
+            self.cells[prev].config(
+                bg=COL_SEL if prev == self.sel else COL_BG)
+        if t is not None:
+            self.cells[t].config(bg="#46507a")
+        self._drag_tgt = t
+
+    def _drag_drop(self, _event):
+        dragged, tgt = self._drag_on, self._drag_tgt
+        src = self._drag_src
+        self._drag_src, self._drag_on, self._drag_tgt = None, False, None
+        if not dragged:
+            return
+        self.win.configure(cursor="")
+        if self.view == "recent" and src is not None and tgt is not None:
+            self._reorder_recent(src[0], tgt)
+        else:
+            self._refresh_list(rebuild_only=True)  # clear the highlight
+
+    def _reorder_recent(self, si, ti):
+        """Drop item si onto slot ti: lock it there (into recent_pinned)."""
+        if not (0 <= si < len(self.filtered) and 0 <= ti < len(self.filtered)):
+            return
+        path = self.filtered[si]["path"]
+        key = path.lower().rstrip("\\")
+        tkey = self.filtered[ti]["path"].lower().rstrip("\\")
+        cfg = load_config()  # re-read so manual edits aren't clobbered
+        pinned = [p for p in cfg.setdefault("recent_pinned", [])
+                  if p.lower().rstrip("\\") != key]
+        idx = next((j for j, p in enumerate(pinned)
+                    if p.lower().rstrip("\\") == tkey), None)
+        if idx is None:
+            pinned.append(path)  # dropped into the recency zone: lock at end
+        else:
+            pinned.insert(idx + 1 if si < ti else idx, path)
+        cfg["recent_pinned"] = pinned
+        self._save_config(cfg)
+        self.status.set("📌 ロックして並び替えました(右クリックで解除)")
+
+    def _pin_toggle(self):
+        item = self._current_item()
+        if not item or not item.get("_recent"):
+            return
+        key = item["path"].lower().rstrip("\\")
+        cfg = load_config()  # re-read so manual edits aren't clobbered
+        pinned = cfg.setdefault("recent_pinned", [])
+        kept = [p for p in pinned if p.lower().rstrip("\\") != key]
+        if len(kept) == len(pinned):
+            kept.append(item["path"])
+            self.status.set("📌 ロックしました(右クリックで解除)")
+        else:
+            self.status.set("ロックを解除しました")
+        cfg["recent_pinned"] = kept
+        self._save_config(cfg)
 
     def _on_focus_out(self, _event):
         def check():
@@ -804,16 +1114,26 @@ class LaunchItApp:
             if preserve_sel and 0 <= self.sel < len(self.filtered):
                 keep = self.filtered[self.sel].get("name")
             raw = self.cfg.get("items", [])
-            expanded = self._expand_wingroups(raw)
-            items = []
-            for it in raw:
-                if it.get("type") == "wingroup":
-                    sub = [x for x in expanded
-                           if x.get("group") == it.get("name")]
-                    sub.sort(key=lambda x: x["name"])
-                    items.extend(sub)
-                else:
-                    items.append(it)
+            expanded = self._expand_wingroups(raw)  # keeps _win_cache fresh
+            if self.view == "recent":
+                limit = max(1, int(self.cfg.get("columns", 2))) * 7
+                pinned = list(self.cfg.get("recent_pinned", []))
+                pset = {p.lower().rstrip("\\") for p in pinned}
+                paths = pinned + [p for p in self._recent
+                                  if p.lower().rstrip("\\") not in pset]
+                items = [{"name": _short_path(p), "type": "folder", "path": p,
+                          "_recent": True, "_pinned": i < len(pinned)}
+                         for i, p in enumerate(paths[:limit])]
+            else:
+                items = []
+                for it in raw:
+                    if it.get("type") == "wingroup":
+                        sub = [x for x in expanded
+                               if x.get("group") == it.get("name")]
+                        sub.sort(key=lambda x: x["name"])
+                        items.extend(sub)
+                    else:
+                        items.append(it)
             if q:
                 subs = [i for i in items if q in i["name"].lower()]
                 rest = [i for i in items if i not in subs and _subseq(q, i["name"].lower())]
@@ -836,12 +1156,14 @@ class LaunchItApp:
         for c in range(ncols, getattr(self, "_max_cols", 0)):
             self.grid_frame.grid_columnconfigure(c, weight=0, uniform="")
         self._max_cols = max(getattr(self, "_max_cols", 0), ncols)
+        # smaller font in the recent view so path tails don't get clipped
+        fnt = (FONT, 10 if self.view == "recent" else 12)
         for i, (item, lbl) in enumerate(zip(self.filtered, self.cells)):
             col, row = divmod(i, nrows)  # column-major: fills down, then right
             lbl.grid(row=row, column=col, sticky="ew")
             text, fg = self._item_label(item)
             selected = (i == self.sel)
-            lbl.config(text=text,
+            lbl.config(text=text, font=fnt,
                        fg="#ffffff" if selected else fg,
                        bg=COL_SEL if selected else COL_BG)
 
@@ -851,6 +1173,8 @@ class LaunchItApp:
         if typ == "_win":
             return f"⌨ {item['name']}", custom or COL_RUN
         if typ == "folder":
+            if item.get("_pinned"):
+                return f"📌 {item['name']}", custom or COL_RUN
             return f"📁 {item['name']}", custom or COL_FG
         if typ == "url":
             return f"🌐 {item['name']}", custom or COL_FG
@@ -865,7 +1189,9 @@ class LaunchItApp:
             lbl = tk.Label(self.grid_frame, font=(FONT, 12), bg=COL_BG,
                            fg=COL_FG, anchor="w", padx=8, pady=3)
             i = len(self.cells)
-            lbl.bind("<Button-1>", lambda e, i=i: self._select(i))
+            lbl.bind("<Button-1>", lambda e, i=i: self._press(e, i))
+            lbl.bind("<B1-Motion>", self._drag_motion)
+            lbl.bind("<ButtonRelease-1>", self._drag_drop)
             lbl.bind("<Double-Button-1>",
                      lambda e, i=i: (self._select(i), self._activate()))
             lbl.bind("<Button-3>",
@@ -946,7 +1272,7 @@ class LaunchItApp:
                     self.status.set("そのウィンドウは閉じられています")
                     self._refresh_list()
             elif typ == "folder":
-                os.startfile(item["path"])
+                self._open_folder(item["path"])
                 self.hide()
             elif typ == "url":
                 webbrowser.open(item["url"])
@@ -988,6 +1314,11 @@ class LaunchItApp:
             m.add_command(label="手前に表示", command=self._activate)
         elif typ == "folder":
             m.add_command(label="開く", command=self._activate)
+            if item.get("_recent"):
+                m.add_command(
+                    label="ロック解除" if item.get("_pinned")
+                    else "ロック(リストに固定)",
+                    command=self._pin_toggle)
         else:
             m.add_command(label="ブラウザで開く", command=self._activate)
         self._menu_open = True
@@ -1303,8 +1634,24 @@ class LaunchItApp:
         path = item.get("path") or ""
         target = path if os.path.isdir(path) else os.path.dirname(path)
         if target and os.path.exists(target):
-            os.startfile(target)
+            self._open_folder(target)
             self.hide()
+
+    def _open_folder(self, path):
+        """Open a folder; if an Explorer window already shows it, focus that
+        window instead of opening a duplicate."""
+        want = os.path.normpath(path).lower().rstrip("\\")
+        try:
+            wins = _explorer_windows()
+        except Exception:
+            log.exception("explorer window enumeration failed")
+            wins = []
+        for hwnd, p in wins:
+            if p == want and ctypes.windll.user32.IsWindow(hwnd):
+                _focus_window(hwnd)
+                log.info("focused explorer window for %s", path)
+                return
+        os.startfile(path)
 
     def _stop(self):
         self._proc_action("stop", "停止")
@@ -1467,6 +1814,10 @@ def main():
 
     root = tk.Tk()
     root.withdraw()
+    try:
+        root.iconbitmap(default=os.path.join(BASE_DIR, "launchit.ico"))
+    except tk.TclError:
+        pass  # missing/broken ico: editor windows just keep the Tk default
     app = LaunchItApp(root, cfg, pm, cmd_queue, tray, hotkey)
     IPC_HANDLERS["status"] = app.status_json
     log.info("LaunchIt started")

@@ -15,6 +15,22 @@
 - **pystray** — 別スレッド。Windows では左クリック1回で default メニュー項目が発火
 - **ポートウォッチャー** — url/check_port 持ちの app 項目へ TCP 接続で稼働判定。表示中5s/非表示20s、`_port_kick` イベントで即時再スキャン
 
+### 最近使ったフォルダビュー
+
+検索欄が空のとき Space で main/recent ビューをトグル(`_toggle_view`)。
+ホットキーは3状態サイクル(`toggle()`): 非表示→main→recent→非表示
+(修飾キー押しっぱなしで Space 連打するとフォルダモードに入れる)。
+`_recent_folders()` が shell Recent (`%APPDATA%\Microsoft\Windows\Recent\*.lnk`)
+を IShellLinkW(ctypes COM 直叩き)で解決しフォルダのみ新しい順に返す。
+show 時にバックグラウンドで先読み(10秒スロットル)。フォルダを開くとき
+`_explorer_windows()`(IShellWindows)で既存エクスプローラのパスを照合し、
+一致すれば前面化、なければ startfile。vtable 実測値: IShellWindows の
+get_Count=7 / Item=8、IWebBrowser2 の get_LocationURL=30 / get_HWND=37。
+ロック(📌)は `recent_pinned`(パス配列=表示順)に保存され先頭に固定表示。
+ドラッグ(`_press`/`_drag_motion`/`_drag_drop`)でロック位置を並び替え、
+未ロック項目のドロップはその位置にロック。ロジックは scratchpad の
+test_pin_logic.py 方式(CONFIG_PATH を差し替えてヘッドレス実体化)で検証可。
+
 ### 実行中判定(3系統)
 
 1. ProcessManager 追跡(自分で起動した Popen / adopt した pid)
@@ -43,6 +59,12 @@ ConsoleWindowClass)を `_refresh_list` 内で毎回列挙して合成項目 `typ
 - **Windows Terminal のタブ**: ウィンドウタイトル=アクティブタブのみ。背後のタブは検出不能(UIA を使わない限り)
 - **タイトルを設定しないCLI(Codex等)** はラッパー bat に `title X - %CD%` を1行足せば検出可能に
 - **自動再起動型スーパーバイザ**(例: AI-Toolkit の `concurrently --restart-tries -1`)は子を殺しても1秒で蘇生する。ポート所有プロセスから親(node/cmd)を遡って根元を taskkill /T /F(`stop_ai_toolkit.py` 参照)。`taskkill /IM node.exe` のような全殺しは絶対にしない
+- **Win11 エクスプローラのタブは同一 hwnd を共有する**。IShellWindows は
+  タブごとに1エントリ返すが hwnd は同じ → 前面化はウィンドウ単位まで
+  (目的のタブが選択されるとは限らない)。UIA を使わない限り WT のタブと同じ制限
+- **os.path.isdir は切断されたネットワークパスで数秒ブロックする** →
+  Recent の解決(isdir 含む)は必ずワーカースレッドで。Tk スレッドでやると
+  ポップアップが固まる
 - **ホットキーが「効かない」デバッグ手順**: ①launchit.log の `hotkey fired (foreground=...)` を見る(届いているか)→ ②合成キー(keybd_event)で動くか → ③動くのに物理で動かないなら WH_KEYBOARD_LL の一時ロガーで LLKHF_INJECTED フラグ付きで記録 → **ユーザーが実際に押しているキーをまず疑う**(本件の実例: Shift+Space と言いながら Ctrl+Space を押していた)。UAC 無効環境(EnableLUA=0)では昇格説は成立しない
 
 ## 検証方法
@@ -62,6 +84,12 @@ GUI テストは scratchpad に使い捨てスクリプトを書く方式(リポ
 ## 中断時点の状態 (2026-07-09)
 
 - v1 完成・全機能検証済み・GitHub に公開済み。既知バグなし
+- 同日追加: launchit.ico(オレンジのロケット、生成スクリプトは scratchpad)、
+  スタートアップ登録済み(LaunchIt.lnk → LaunchIt.vbs)、手動起動用 LaunchIt.bat、
+  最近使ったフォルダビュー(Space トグル)
+- Claude Code セッション検出は `%USERPROFILE%\.local\shims\claude.cmd`
+  (title 固定 + CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1)経由で確実化。
+  shims は PATH 未登録(手打ち claude は従来の ✳/スピナー正規表現で検出)
 - ローカルでは常駐インスタンスが稼働中(ユーザー設定は launchit.json)
 - 未実装のアイデア: Windows Terminal 背後タブの UIA 列挙、ブラウザ拡張による
   タブ直接フォーカス、項目アイコン、ドラッグ&ドロップ追加

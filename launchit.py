@@ -182,12 +182,24 @@ class HotkeyListener(threading.Thread):
 
     def _reinject(self, user32):
         """Hand the swallowed combo back to the foreground app: unregister,
-        synthesize the same keys, re-register."""
+        synthesize the trigger key, re-register. The modifiers are still
+        physically held by the user, so only the non-modifier key needs
+        synthesizing. Three subtleties (all bite FX Console):
+        - real scancodes are required — apps matching keys via
+          GetKeyNameTextW ignore scan=0 synthetic input
+        - the swallowed physical down left the key state 'down', so a bare
+          synthetic down would be delivered as an auto-repeat (previous-state
+          bit set) and get ignored; clear it with an up first
+        - the down must be held a humanlike beat before releasing — key-state
+          pollers (GetKeyState on a timer/idle hook) never see a
+          back-to-back down/up"""
         user32.UnregisterHotKey(None, 1)
-        for vk in self._combo_vks:
-            user32.keybd_event(vk, 0, 0, 0)
-        for vk in reversed(self._combo_vks):
-            user32.keybd_event(vk, 0, 2, 0)
+        vk = self._combo_vks[-1]
+        scan = user32.MapVirtualKeyW(vk, 0)
+        user32.keybd_event(vk, scan, 2, 0)
+        user32.keybd_event(vk, scan, 0, 0)
+        _sleep(0.1)
+        user32.keybd_event(vk, scan, 2, 0)
         # let the foreground app consume the synthetic keys before we
         # re-register, or we would swallow them again ourselves
         _sleep(0.15)

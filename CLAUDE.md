@@ -95,6 +95,17 @@ ConsoleWindowClass)を `_refresh_list` 内で毎回列挙して合成項目 `typ
   ユーザー判断で機能ごと廃止済み。次に頼まれたら DirectComposition 等の
   全面書き直しが必要になる旨を先に伝えること
 - **ホットキーが「効かない」デバッグ手順**: ①launchit.log の `hotkey fired (foreground=...)` を見る(届いているか)→ ②合成キー(keybd_event)で動くか → ③動くのに物理で動かないなら WH_KEYBOARD_LL の一時ロガーで LLKHF_INJECTED フラグ付きで記録 → **ユーザーが実際に押しているキーをまず疑う**(本件の実例: Shift+Space と言いながら Ctrl+Space を押していた)。UAC 無効環境(EnableLUA=0)では昇格説は成立しない
+- **パススルーの打ち返しは「そのままキーを再合成」では届かない**(実例:
+  AE の VideoCopilot FX Console、2026-07-22 に実測解決)。必要条件は3つ:
+  ①スキャンコード必須(MapVirtualKeyW で付与。scan=0 は GetKeyNameTextW
+  系の照合に不可視)②WM_HOTKEY に食われた物理 down はキー状態が押下中の
+  まま残るので、先に up を注入してから down しないとオートリピート扱いで
+  無視される ③down は 0.1s 保持してから up(GetKeyState ポーリング型は
+  瞬間 down/up を観測できない)。修飾キーはユーザーが物理で押しっぱなし
+  なので再合成不要(トリガーキーのみ注入)。FX Console のポップアップは
+  AfterFX プロセスの `VCSDK_WINDOW_CLASS`/'Effects Popup' ウィンドウ
+  (非表示で待機、フォーカス喪失で自動クローズ)なので可視化の有無で検証可
+
 ## 検証方法
 
 GUI テストは scratchpad に使い捨てスクリプトを書く方式(リポジトリには含めない):

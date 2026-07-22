@@ -34,8 +34,23 @@ test_pin_logic.py 方式(CONFIG_PATH を差し替えてヘッドレス実体化)
 ### 実行中判定(3系統)
 
 1. ProcessManager 追跡(自分で起動した Popen / adopt した pid)
-2. adopt_running: 外部起動の取り込み。.bat=cmd.exe の CommandLine 照合、.exe=ExecutablePath 照合(CIM 1クエリ)。多プロセス app(Electron等)は ParentProcessId でルートを選んで adopt(子レンダラを掴むと停止が部分的にしか効かない)。起動時+トレイ再スキャン+ポップアップ表示時(60秒スロットル)。**「startで実体を起動して即exitするラッパーbat」は3系統のどれからも見えない** → 項目の path を実体exeに変えて args/cwd で補う(Octopus の例)
+2. adopt_running: 外部起動の取り込み。.bat=cmd.exe の CommandLine 照合、.exe=ExecutablePath 照合(CIM 1クエリ)。多プロセス app(Electron等)は ParentProcessId でルートを選んで adopt(子レンダラを掴むと停止が部分的にしか効かない)。どちらも外れたら**稼働判定ポートの所有 pid を adopt**(`_tcp_listeners` = GetExtendedTcpTable、サブプロセス不要。MCP が bat を経由せず起動した ComfyUI 対策)。起動時+トレイ再スキャン+ポップアップ表示時(60秒スロットル)。**「startで実体を起動して即exitするラッパーbat」は追跡から見えない** → 項目の path を実体exeに変えて args/cwd で補う(Octopus の例)
 3. ポート稼働(上記ウォッチャー)。`_is_active` = 1 or 3
+
+stop() は tracked ツリー kill 後もポートが生きていればポート所有者ツリーを
+kill(最終フォールバック)。restart() はポート解放を待ってから launch
+(即 launch すると新インスタンスが bind で死ぬ)。
+
+### 複数インスタンス検出(scan_exe/scan_re)
+
+app 項目に `scan_exe`(既定 python.exe)+`scan_re`(CommandLine 照合)を
+書くと、adopt_running が本来ポート以外で LISTEN する同種プロセスを
+`pm.instances`(name→[{port,pid}])に集め、`_refresh_list` が親項目直下に
+合成項目 `type:"_proc"`(名前 `ComfyUI :8189`)として展開する。Enter=
+ブラウザで開く、右クリック→停止= pid ツリー kill。表示時に `_pid_alive`
+で死骸をフィルタ。IPC `status` の `_instances` で確認可。ComfyUI 実設定:
+`"scan_re": "(?i)comfyui[\\\\/]main\\.py"`(MCP 直起動は
+`python.exe ComfyUI\main.py --port XXXX` 形式で bat を通らない)。
 
 ### wingroup(CLIセッション検出)
 
@@ -80,7 +95,6 @@ ConsoleWindowClass)を `_refresh_list` 内で毎回列挙して合成項目 `typ
   ユーザー判断で機能ごと廃止済み。次に頼まれたら DirectComposition 等の
   全面書き直しが必要になる旨を先に伝えること
 - **ホットキーが「効かない」デバッグ手順**: ①launchit.log の `hotkey fired (foreground=...)` を見る(届いているか)→ ②合成キー(keybd_event)で動くか → ③動くのに物理で動かないなら WH_KEYBOARD_LL の一時ロガーで LLKHF_INJECTED フラグ付きで記録 → **ユーザーが実際に押しているキーをまず疑う**(本件の実例: Shift+Space と言いながら Ctrl+Space を押していた)。UAC 無効環境(EnableLUA=0)では昇格説は成立しない
-
 ## 検証方法
 
 GUI テストは scratchpad に使い捨てスクリプトを書く方式(リポジトリには含めない):
@@ -95,7 +109,15 @@ GUI テストは scratchpad に使い捨てスクリプトを書く方式(リポ
 最小限にし、動かした物は元に戻す。ユーザーの実操作と競合して偽陽性が出ることがある
 (showテストのタイムアウトは大抵これ)。
 
-## 中断時点の状態 (2026-07-09)
+## 中断時点の状態 (2026-07-14)
+
+- ポート所有者 adopt / stop フォールバック / scan_re 複数インスタンス表示を
+  追加(上記)。実例: ComfyUI MCP サーバーが 8188 を bat 非経由で起動 →
+  3系統のどれにも掴めず停止・再起動が no-op になっていた
+- ヘッドレス検証: scratchpad の test_port_adopt.py 方式(ダミー
+  `python -m http.server` 2本で adopt/scan/stop フォールバックを実測)
+
+## 以前の状態 (2026-07-09)
 
 - v1 完成・全機能検証済み・GitHub に公開済み。既知バグなし
 - 同日追加: launchit.ico(オレンジのロケット、生成スクリプトは scratchpad)、

@@ -240,11 +240,36 @@ def _port_open(target, timeout=0.3):
         return False
 
 
+def _tcp_listeners():
+    """{local_port: owning_pid} for IPv4 TCP LISTEN sockets
+    (GetExtendedTcpTable — no subprocess, cheap enough to call per scan)."""
+    AF_INET, TABLE_LISTENER = 2, 3
+
+    class _Row(ctypes.Structure):
+        _fields_ = [(n, ctypes.wintypes.DWORD) for n in
+                    ("state", "addr", "port", "raddr", "rport", "pid")]
+
+    iphlp = ctypes.windll.iphlpapi
+    size = ctypes.wintypes.DWORD(0)
+    iphlp.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET,
+                              TABLE_LISTENER, 0)
+    buf = ctypes.create_string_buffer(size.value)
+    if iphlp.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET,
+                                 TABLE_LISTENER, 0):
+        return {}
+    n = ctypes.cast(buf, ctypes.POINTER(ctypes.wintypes.DWORD)).contents.value
+    rows = ctypes.cast(ctypes.byref(buf, 4), ctypes.POINTER(_Row * n)).contents
+    return {socket.ntohs(r.port & 0xFFFF): r.pid for r in rows}
+
+
 class ProcessManager:
     """Tracks launched apps by item name; stop kills the whole process tree."""
 
     def __init__(self):
         self.procs = {}  # name -> {"popen": Popen|None, "pid": int}
+        # name -> [{"port": int, "pid": int}] extra instances of a scan_re
+        # item running on ports other than its own (e.g. MCP-started ComfyUI)
+        self.instances = {}
 
     def pid_of(self, name):
         rec = self.procs.get(name)
@@ -313,19 +338,47 @@ class ProcessManager:
                     break
                 _sleep(0.1)
             log.info("stopped %s (pid %d)", name, pid)
-            return True
+            if not (target and _port_open(target)):
+                return True
+            log.warning("%s: port still open after killing pid %d", name, pid)
+        # fallback: the port answers but we don't own the process — started
+        # outside LaunchIt without the launcher .bat (e.g. by an MCP server).
+        # Kill the port owner's tree instead.
+        if target and _port_open(target):
+            owner = _tcp_listeners().get(target[1])
+            if owner and owner > 4 and _pid_alive(owner):
+                _kill_tree(owner)
+                for _ in range(50):
+                    if not _port_open(target):
+                        break
+                    _sleep(0.1)
+                log.info("stopped %s via port owner (pid %d)", name, owner)
+                return True
+            log.warning("stop %s: port %d is open but owner is unknown",
+                        name, target[1])
         return False
 
     def restart(self, item):
         self.stop(item)
+        target = _check_target(item)
+        if target:
+            # wait for the old instance to release the port, or the new one
+            # dies on bind
+            for _ in range(100):
+                if not _port_open(target):
+                    break
+                _sleep(0.1)
         self.launch(item)
 
     def adopt_running(self, items):
         """Find already-running instances of our entries and take over their
         pids, so apps started outside LaunchIt (or before a LaunchIt restart)
         can still be stopped/restarted. .bat entries are matched by cmd.exe
-        command line, .exe entries by executable path."""
-        bat_items, exe_items = [], []
+        command line, .exe entries by executable path; items with a health-
+        check port fall back to adopting the port-owning process. Items with
+        a "scan_re" (matched against scan_exe command lines) also collect
+        extra instances listening on other ports into self.instances."""
+        bat_items, exe_items, scan_items, port_items = [], [], [], []
         for i in items:
             if i.get("type", "app") != "app" or not i.get("track", True):
                 continue
@@ -334,32 +387,40 @@ class ProcessManager:
                 bat_items.append(i)
             elif ext == ".exe":
                 exe_items.append(i)
-        if not bat_items and not exe_items:
+            if i.get("scan_re"):
+                scan_items.append(i)
+            if _check_target(i):
+                port_items.append(i)
+        if not (bat_items or exe_items or scan_items or port_items):
             return 0
-        names = {os.path.basename(i["path"]) for i in exe_items}
-        if bat_items:
-            names.add("cmd.exe")
-        flt = " OR ".join(f"Name='{n}'" for n in sorted(names))
-        ps = (f"Get-CimInstance Win32_Process -Filter \"{flt}\" | "
-              "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,"
-              "CommandLine | ConvertTo-Json -Compress")
-        try:
-            out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps],
-                capture_output=True, text=True, timeout=30,
-                creationflags=CREATE_NO_WINDOW,
-            )
-            data = json.loads(out.stdout or "[]")
-        except Exception as e:
-            log.error("adopt scan failed: %s", e)
-            return 0
-        if isinstance(data, dict):
-            data = [data]
+        data = []
+        if bat_items or exe_items or scan_items:
+            names = {os.path.basename(i["path"]) for i in exe_items}
+            if bat_items:
+                names.add("cmd.exe")
+            for i in scan_items:
+                names.add(i.get("scan_exe", "python.exe"))
+            flt = " OR ".join(f"Name='{n}'" for n in sorted(names))
+            ps = (f"Get-CimInstance Win32_Process -Filter \"{flt}\" | "
+                  "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,"
+                  "CommandLine | ConvertTo-Json -Compress")
+            try:
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                data = json.loads(out.stdout or "[]")
+            except Exception as e:
+                log.error("adopt scan failed: %s", e)
+                return 0
+            if isinstance(data, dict):
+                data = [data]
         adopted = 0
 
-        def adopt(item, proc):
-            self.procs[item["name"]] = {"popen": None, "pid": proc["ProcessId"]}
-            log.info("adopted %s (pid %s)", item["name"], proc["ProcessId"])
+        def adopt(item, pid, how=""):
+            self.procs[item["name"]] = {"popen": None, "pid": pid}
+            log.info("adopted %s (pid %s)%s", item["name"], pid, how)
 
         for item in bat_items:
             if self.is_running(item["name"]):
@@ -369,7 +430,7 @@ class ProcessManager:
                 cmdline = (proc.get("CommandLine") or "").lower().replace("/", "\\")
                 if (proc.get("Name", "").lower() == "cmd.exe"
                         and needle in cmdline):
-                    adopt(item, proc)
+                    adopt(item, proc["ProcessId"])
                     adopted += 1
                     break
         for item in exe_items:
@@ -387,8 +448,40 @@ class ProcessManager:
             pids = {p["ProcessId"] for p in cands}
             root = next((p for p in cands
                          if p.get("ParentProcessId") not in pids), cands[0])
-            adopt(item, root)
+            adopt(item, root["ProcessId"])
             adopted += 1
+        listeners = _tcp_listeners()
+        # last resort: adopt whoever owns the health-check port, so instances
+        # started without the launcher .bat (e.g. by an MCP server) can still
+        # be stopped/restarted
+        for item in port_items:
+            if self.is_running(item["name"]):
+                continue
+            port = _check_target(item)[1]
+            pid = listeners.get(port)
+            if pid and pid > 4 and _pid_alive(pid):
+                adopt(item, pid, f" via port {port}")
+                adopted += 1
+        instances = {}
+        for item in scan_items:
+            try:
+                pat = re.compile(item["scan_re"])
+            except re.error:
+                log.error("bad scan_re in %s", item["name"])
+                continue
+            exe = item.get("scan_exe", "python.exe").lower()
+            target = _check_target(item)
+            main_port = target[1] if target else None
+            pids = {p["ProcessId"] for p in data
+                    if (p.get("Name") or "").lower() == exe
+                    and pat.search(p.get("CommandLine") or "")}
+            own = self.pid_of(item["name"])  # don't list the adopted
+            extra = [{"port": port, "pid": pid}  # instance as an extra
+                     for port, pid in sorted(listeners.items())
+                     if pid in pids and port != main_port and pid != own]
+            if extra:
+                instances[item["name"]] = extra
+        self.instances = instances
         return adopted
 
 
@@ -1182,6 +1275,16 @@ class LaunchItApp:
                         items.extend(sub)
                     else:
                         items.append(it)
+                        # extra detected instances (scan_re) right below
+                        # their parent app, one row per port
+                        for ins in self.pm.instances.get(it.get("name"), []):
+                            if _pid_alive(ins["pid"]):
+                                items.append({
+                                    "type": "_proc", "group": it["name"],
+                                    "name": f"{it['name']} :{ins['port']}",
+                                    "pid": ins["pid"], "port": ins["port"],
+                                    "url": f"http://127.0.0.1:{ins['port']}",
+                                    "color": it.get("color")})
             if q:
                 subs = [i for i in items if q in i["name"].lower()]
                 rest = [i for i in items if i not in subs and _subseq(q, i["name"].lower())]
@@ -1227,6 +1330,8 @@ class LaunchItApp:
                 # the dancing-mascot PhotoImage takes the icon's place
                 return f" {item['name']}", custom or COL_RUN
             return f"⌨ {item['name']}", custom or COL_RUN
+        if typ == "_proc":
+            return f"●  {item['name']}", custom or COL_RUN
         if typ == "folder":
             if item.get("_pinned"):
                 return f"📌 {item['name']}", custom or COL_RUN
@@ -1319,6 +1424,9 @@ class LaunchItApp:
                 }
         out["_sessions"] = sorted(
             it["name"] for it, _ts in self._win_cache.values())
+        out["_instances"] = {
+            n: [e["port"] for e in v]
+            for n, v in self.pm.instances.items()}
         return json.dumps(out, ensure_ascii=False).encode("utf-8")
 
     # ---- actions ----
@@ -1336,6 +1444,9 @@ class LaunchItApp:
                 else:
                     self.status.set("そのウィンドウは閉じられています")
                     self._refresh_list()
+            elif typ == "_proc":
+                webbrowser.open(item["url"])
+                self.hide()
             elif typ == "folder":
                 self._open_folder(item["path"])
                 self.hide()
@@ -1377,6 +1488,9 @@ class LaunchItApp:
             m.add_command(label="フォルダを開く", command=self._open_dir)
         elif typ == "_win":
             m.add_command(label="手前に表示", command=self._activate)
+        elif typ == "_proc":
+            m.add_command(label="ブラウザで開く", command=self._activate)
+            m.add_command(label="停止", command=self._stop)
         elif typ == "folder":
             m.add_command(label="開く", command=self._activate)
             if item.get("_recent"):
@@ -1726,6 +1840,29 @@ class LaunchItApp:
 
     def _proc_action(self, action, label):
         item = self._current_item()
+        if item and item.get("type") == "_proc":
+            if action != "stop":
+                self.status.set("検出インスタンスは停止のみ対応です")
+                return "break"
+            self.status.set(f"{label}中: {item['name']} ...")
+
+            def pwork():
+                try:
+                    _kill_tree(item["pid"])
+                    for _ in range(50):
+                        if not _pid_alive(item["pid"]):
+                            break
+                        _sleep(0.1)
+                    log.info("stopped %s (pid %d)", item["name"], item["pid"])
+                    self.pm.instances[item["group"]] = [
+                        e for e in self.pm.instances.get(item["group"], [])
+                        if e["pid"] != item["pid"]]
+                except Exception:
+                    log.exception("stop failed: %s", item["name"])
+                self.q.put("action_done")
+
+            threading.Thread(target=pwork, daemon=True).start()
+            return
         if (not item or item.get("type", "app") != "app"
                 or not item.get("track", True)):
             return "break"
